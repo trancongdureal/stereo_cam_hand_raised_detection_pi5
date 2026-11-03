@@ -1,0 +1,9 @@
+# Core packages for OpenCV and Math
+# Note: On Raspberry Pi, we use opencv-python-headless or system packages depending on the environment.
+# Usually, it's better to rely on system packages for opencv on Pi to take advantage of hardware accel.
+# If using a virtual environment, we install standard ones:
+opencv-python>=4.5.0
+numpy>=1.21.0
+
+# DO NOT ADD picamera2 here if it's installed via apt (python3-picamera2). 
+# Pip install of picamera2 often fails or lacks system dependencies.

@@ -1,0 +1,22 @@
+# Môi trường ảo Python (Virtual Environments)
+venv-test/
+.export-env/
+yolo-env/
+venv/
+.env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Thư mục dữ liệu thử nghiệm ảnh chụp bàn cờ (Tránh nặng Repo)
+prototype_*/
+
+# IDE & Hệ điều hành
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+read_log.md
+*.pt

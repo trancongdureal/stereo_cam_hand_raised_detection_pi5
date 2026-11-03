@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment files
+.DS_Store
+.idea/
+.vscode/
+
+# Local calibration data (optional: comment out if you want to commit your calibration dataset)
+# calibration_images/left/*.png
+# calibration_images/right/*.png
+# calibration_result/*.npz
+# calibration_result/*.yml
+# calibration_result/*.csv
+# calibration_result/*.txt
+# debug/*.png
+
+# Local config - if you don't want to commit hardware IDs, though config.py is usually needed as a template.
+# config.py
+
+# System
+Thumbs.db
