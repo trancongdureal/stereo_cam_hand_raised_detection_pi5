@@ -61,7 +61,7 @@ OUTPUT_DIRECTORY = 'stereo_vision'
 # The physically measured distance between the left and right camera lenses.
 # Units must match SQUARE_SIZE (e.g., in meters).
 # Used purely for validation/warnings, it does not force the calibration.
-EXPECTED_BASELINE = 0.5045  # Example: 12 cm = 0.12 m
+EXPECTED_BASELINE = 0.5075  # Example: 12 cm = 0.12 m
 
 # ==============================================================================
 # ADVANCED SETTINGS (Usually don't need to edit)
@@ -87,3 +87,8 @@ DIR_LEFT_IMAGES = os.path.join(DIR_CALIB_IMAGES, 'left')
 DIR_RIGHT_IMAGES = os.path.join(DIR_CALIB_IMAGES, 'right')
 DIR_CALIB_RESULT = os.path.join(OUTPUT_DIRECTORY, 'calibration_result')
 DIR_DEBUG = os.path.join(OUTPUT_DIRECTORY, 'debug')
+
+# File thông số nội tại (K1, D1, K2, D2) mẫu để chạy hiệu chuẩn ngoại tại nhanh
+# Có thể trỏ tới bất kỳ file stereo_calibration.npz hoặc camera_intrinsics.npz nào
+INTRINSICS_FILE = os.path.join(DIR_CALIB_RESULT, 'stereo_calibration.npz')
+
