@@ -136,6 +136,7 @@ class TrackedPerson:
         self.d_mid_cm = None
         self.z_cm = None
         self.x_mid_cm = None
+        self.last_3d_time = None
 
     @property
     def center(self):
@@ -184,8 +185,9 @@ class TrackedPerson:
     def mark_missed(self):
         self.lost_frames += 1
 
-    def update_3d(self, d_mid, z, x_mid, alpha=0.35):
+    def update_3d(self, d_mid, z, x_mid, now=None, alpha=0.35):
         """Làm mịn EMA cho tọa độ 3D"""
+        self.last_3d_time = now if now is not None else time.time()
         if self.d_mid_cm is None:
             self.d_mid_cm = float(d_mid)
             self.z_cm = float(z)
@@ -194,6 +196,12 @@ class TrackedPerson:
             self.d_mid_cm = alpha * float(d_mid) + (1.0 - alpha) * self.d_mid_cm
             self.z_cm = alpha * float(z) + (1.0 - alpha) * self.z_cm
             self.x_mid_cm = alpha * float(x_mid) + (1.0 - alpha) * self.x_mid_cm
+
+    def is_3d_fresh(self, now, max_age=0.8):
+        """Kiểm tra xem số đo 3D có còn mới (trong vòng 0.8s) hay không"""
+        if self.d_mid_cm is None or self.last_3d_time is None:
+            return False
+        return (now - self.last_3d_time) <= max_age
 
 class LightweightTracker:
     """Bộ theo dõi đa đối tượng IoU Matching siêu nhẹ (<0.1ms)"""
@@ -270,6 +278,8 @@ class TargetLockController:
         self.lock_timestamp = None
         self.status_message = f"DA RESET (Ly do: {reason})"
         logger.info(f"[TARGET LOCK] Reset thanh cong. Target cu: {prev}. Ly do: {reason}")
+        if prev is not None:
+            print(f"[TARGET UNLOCKED] Target #{prev} da nha khoa. Ly do: {reason}. Quay lai quan sat.", flush=True)
 
     def update(self, tracks, now):
         if self.locked_track_id is not None:
@@ -302,11 +312,13 @@ class TargetLockController:
             best_candidate = max(candidates, key=lambda t: t.height)
             self.locked_track_id = best_candidate.track_id
             self.lock_timestamp = now
-            self.status_message = f"DA KHOA TARGET #{self.locked_track_id} (Gio tay > 2s & Gan nhat)"
+            self.status_message = f"DA KHOA TARGET #{self.locked_track_id} (Gio tay >= {self.lock_hold_seconds:.1f}s & Gan nhat)"
             logger.info(f"[TARGET LOCK] {self.status_message}")
+            side_info = f" [{best_candidate.raise_side}]" if best_candidate.raise_side else ""
+            print(f"\n>>> [TARGET LOCK TRIGGERED] Da khoa Target #{self.locked_track_id}{side_info} (Gio tay >= {self.lock_hold_seconds:.1f}s) <<<", flush=True)
             return best_candidate
 
-        self.status_message = "DANG QUAN SAT (GIO TAY > 2S DE KHOA)"
+        self.status_message = f"DANG QUAN SAT (GIO TAY >= {self.lock_hold_seconds:.1f}S DE KHOA)"
         return None
 
 
@@ -351,6 +363,15 @@ class StereoTriangulator:
 
         self.half_baseline = self.baseline / 2.0
 
+    def rectify_point(self, pt, cam_idx=1):
+        """Nắn chuẩn tọa độ 1 điểm từ ảnh thô sang ảnh nắn chuẩn (rectified coordinates) để triệt tiêu góc chụm"""
+        arr = np.array(pt, dtype=np.float32).reshape(-1, 1, 2)
+        if cam_idx == 1:
+            rect = cv2.undistortPoints(arr, self.K1, self.D1, R=self.R1, P=self.P1)
+        else:
+            rect = cv2.undistortPoints(arr, self.K2, self.D2, R=self.R2, P=self.P2)
+        return rect.reshape(-1, 2)[0]
+
     def triangulate_single_point(self, pt_left, pt_right):
         """Tam giác đạc cho 1 cặp điểm (u, v) trên Cam Trái và Cam Phải"""
         pl = np.array(pt_left, dtype=np.float32).reshape(-1, 1, 2)
@@ -375,9 +396,9 @@ class StereoTriangulator:
         D_mid = float(np.sqrt(X_mid**2 + Y_mid**2 + Z_mid**2))
         return X_mid, Y_mid, Z_mid, D_mid
 
-    def match_epipolar_patch(self, frame_left, frame_right, pt_left, patch_size=35, search_width=650, v_range=40):
+    def match_epipolar_patch(self, frame_left, frame_right, pt_left, patch_size=35, v_range=50):
         """
-        Dò điểm tương ứng trên Cam Phải dọc theo dải epipolar (hỗ trợ độ lệch dọc v_range +-40px, search_width=650px).
+        Dò điểm tương ứng trên Cam Phải dọc theo dải epipolar quét toàn bộ chiều ngang ảnh.
         Dùng làm fallback an toàn khi YOLO trên Cam Phải bị che khuất một phần.
         """
         h, w = frame_left.shape[:2]
@@ -389,11 +410,12 @@ class StereoTriangulator:
 
         patch = frame_left[y_l - half_p:y_l + half_p + 1, x_l - half_p:x_l + half_p + 1]
 
-        # Cho phép biên độ tìm kiếm dọc rộng hơn (v_range) để bắt được trên ảnh chưa nắn
+        # Cho phép biên độ tìm kiếm dọc v_range và quét toàn bộ chiều ngang ảnh
+        # để đảm bảo không bị bỏ sót khi camera lắp chụm góc (toe-in)
         y_min = max(0, y_l - v_range)
         y_max = min(h, y_l + v_range + 1)
-        x_min = max(0, x_l - search_width)
-        x_max = min(w, x_l + 25)
+        x_min = 0
+        x_max = w
 
         strip = frame_right[y_min:y_max, x_min:x_max]
         if strip.shape[0] < patch.shape[0] or strip.shape[1] < patch.shape[1]:
@@ -638,6 +660,8 @@ def start_web_server(port=5000):
 def resolve_calibration_file(custom_path=None):
     candidates = [
         custom_path,
+        "camera_parameters/calibration_result/stereo_calibration.npz",
+        "camera_parameters/stereo_calibration.npz",
         os.path.join(os.path.expanduser("~"), "hand_detection/calibrate-camera/stereo_vision/calibration_result/stereo_calibration.npz"),
         os.path.join(os.path.expanduser("~"), "hand_detection/stereo_vision/calibration_result/stereo_calibration.npz"),
         "stereo_vision/calibration_result/stereo_calibration.npz",
@@ -745,6 +769,7 @@ def main():
     fps_timer = time.time()
     fps = 0.0
     current_preview_target_id = None
+    last_terminal_print_time = 0.0
 
     logger.info("Bắt đầu vòng lặp xử lý chính. Nhấn phím 'p' để reset target, phím 'q' để thoát.")
 
@@ -850,53 +875,70 @@ def main():
             bbox_center_r = None
             matched_r_box = None
             matched_r_kpts = None
+            best_match_idx = None
 
             if target_to_measure is not None and target_to_measure.lost_frames == 0:
                 cx_l, cy_l = target_to_measure.center
+                # Nắn chuẩn tâm Bbox Cam Trái để triệt tiêu góc chụm
+                pt_l_rect = stereo_solver.rectify_point((cx_l, cy_l), cam_idx=1)
 
                 # 4.1. Khớp đối tượng tương ứng trên Camera Phải bằng kết quả YOLO Cam Phải
                 if res_r and res_r.boxes is not None and len(res_r.boxes) > 0:
                     boxes_r = res_r.boxes.xyxy.cpu().numpy()
                     kpts_r = res_r.keypoints.data.cpu().numpy()
 
-                    best_match_idx = None
-                    min_cost = float('inf')
+                    # TRƯỜNG HỢP A: Chỉ có 1 người duy nhất ở Cam Phải (Auto-Pair trực tiếp như demo_raise_hand_stereo.py)
+                    if len(boxes_r) == 1:
+                        best_match_idx = 0
+                    else:
+                        # TRƯỜNG HỢP B: Có từ 2 người trở lên -> Ghép đôi trên Không gian nắn chuẩn (Rectified Space)
+                        min_cost = float('inf')
+                        for j in range(len(boxes_r)):
+                            rx1, ry1, rx2, ry2 = boxes_r[j]
+                            rcx = (rx1 + rx2) / 2.0
+                            rcy = (ry1 + ry2) / 2.0
+                            r_height = ry2 - ry1
 
-                    for j in range(len(boxes_r)):
-                        rx1, ry1, rx2, ry2 = boxes_r[j]
-                        rcx = (rx1 + rx2) / 2.0
-                        rcy = (ry1 + ry2) / 2.0
-                        r_height = ry2 - ry1
+                            # Nắn chuẩn tâm Bbox Cam Phải qua R2, P2 (loại bỏ hoàn toàn góc xoay chụm)
+                            pt_r_rect = stereo_solver.rectify_point((rcx, rcy), cam_idx=2)
 
-                        y_diff = abs(rcy - cy_l)
-                        # Trong hệ stereo: rcx thường <= cx_l (cho phép dung sai lệch lắp ráp +35px)
-                        disp_penalty = max(0.0, rcx - cx_l - 35.0) * 5.0
+                            # Sai số đường cực dọc nắn chuẩn (lý tưởng = 0)
+                            y_diff_rect = abs(float(pt_r_rect[1] - pt_l_rect[1]))
 
-                        # Chênh lệch chiều cao tương đối
-                        h_ratio = abs(r_height - target_to_measure.height) / max(1.0, target_to_measure.height)
-                        h_penalty = h_ratio * 60.0
+                            # Thị sai nắn chuẩn (phải > 0 trong hệ stereo chuẩn)
+                            disp_rect = float(pt_l_rect[0] - pt_r_rect[0])
 
-                        # Trạng thái giơ tay tương thích
-                        r_raised, _, _ = check_hand_raise(kpts_r[j])
-                        raise_penalty = 0.0 if (r_raised == target_to_measure.is_hand_raised) else 25.0
+                            # Kiểm tra tính hợp lý vật lý của cự ly Z
+                            if disp_rect > 5.0:
+                                z_est = (stereo_solver.P1[0, 0] * stereo_solver.baseline) / disp_rect
+                                z_penalty = 0.0 if (0.3 <= z_est <= 12.0) else 500.0
+                            else:
+                                z_penalty = 1500.0  # Thị sai <= 0: điểm vô lý phía sau camera
 
-                        cost = y_diff * 2.0 + disp_penalty + h_penalty + raise_penalty
-                        if cost < min_cost:
-                            min_cost = cost
-                            best_match_idx = j
+                            # Chênh lệch chiều cao tương đối
+                            h_ratio = abs(r_height - target_to_measure.height) / max(1.0, target_to_measure.height)
+                            h_penalty = h_ratio * 40.0
 
-                    # Ngưỡng chấp nhận nới lỏng (600) hoặc người có cost tốt nhất
-                    if best_match_idx is not None and min_cost < 600.0:
+                            # Trạng thái giơ tay tương thích
+                            r_raised, _, _ = check_hand_raise(kpts_r[j])
+                            raise_penalty = 0.0 if (r_raised == target_to_measure.is_hand_raised) else 25.0
+
+                            cost = y_diff_rect * 2.5 + z_penalty + h_penalty + raise_penalty
+                            if cost < min_cost:
+                                min_cost = cost
+                                best_match_idx = j
+
+                    if best_match_idx is not None and best_match_idx < len(boxes_r):
                         rx1, ry1, rx2, ry2 = map(int, boxes_r[best_match_idx])
                         bbox_center_r = (float((rx1 + rx2) / 2.0), float((ry1 + ry2) / 2.0))
                         matched_r_box = (rx1, ry1, rx2, ry2)
                         matched_r_kpts = kpts_r[best_match_idx]
 
-                # 4.2. Fallback: Nếu YOLO Cam Phải không bắt được, dùng Epipolar Patch Match
+                # 4.2. Fallback: Nếu YOLO Cam Phải không bắt được (ví dụ bị che khuất), dùng Epipolar Patch Match
                 if bbox_center_r is None:
-                    bbox_center_r = stereo_solver.match_epipolar_patch(frame_l, frame_r, (cx_l, cy_l), patch_size=35, search_width=650, v_range=40)
+                    bbox_center_r = stereo_solver.match_epipolar_patch(frame_l, frame_r, (cx_l, cy_l), patch_size=35, v_range=50)
 
-                # 4.3. Giải tam giác đạc 3D & Kiểm tra tính hợp lệ
+                # 4.3. Giải tam giác đạc 3D: TÂM BBOX -> TRUNG ĐIỂM BASELINE
                 if bbox_center_r is not None:
                     X_mid, Y_mid, Z_mid, D_mid = stereo_solver.triangulate_single_point((cx_l, cy_l), bbox_center_r)
                     # Chỉ chấp nhận khoảng cách thực tế hợp lệ (Z dương và trong cự ly 0.3m đến 12.0m)
@@ -904,23 +946,39 @@ def main():
                         d_cm = D_mid * 100.0
                         z_cm = Z_mid * 100.0
                         x_cm = X_mid * 100.0
-                        target_to_measure.update_3d(d_cm, z_cm, x_cm)
+                        target_to_measure.update_3d(d_cm, z_cm, x_cm, now=now)
 
             # ------------------------------------------------------------------
             # BƯỚC 5: TRỰC QUAN HÓA TRÊN CẢ HAI CAMERA
             # ------------------------------------------------------------------
-            # 5.1. Trực quan hóa trên Camera Phải
+            # 5.1. Trực quan hóa trên Camera Phải: Vẽ tất cả người để luôn thấy AI hoạt động
+            if res_r and res_r.boxes is not None and len(res_r.boxes) > 0:
+                boxes_r_all = res_r.boxes.xyxy.cpu().numpy()
+                kpts_r_all = res_r.keypoints.data.cpu().numpy()
+                confs_r_all = res_r.boxes.conf.cpu().numpy()
+
+                for j in range(len(boxes_r_all)):
+                    if best_match_idx is not None and j == best_match_idx:
+                        continue  # Người đã match sẽ được vẽ nổi bật riêng bên dưới
+                    bx1, by1, bx2, by2 = map(int, boxes_r_all[j])
+                    cv2.rectangle(disp_r, (bx1, by1), (bx2, by2), (140, 140, 140), 1)
+                    draw_skeleton(disp_r, kpts_r_all[j], color=(120, 120, 120))
+                    cv2.putText(disp_r, f"Person ({confs_r_all[j]:.2f})", (bx1, max(20, by1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1)
+
             if matched_r_box is not None:
                 rx1, ry1, rx2, ry2 = matched_r_box
-                box_color_r = (0, 0, 255) if (locked_target and target_to_measure.track_id == locked_target.track_id) else (0, 255, 0)
-                cv2.rectangle(disp_r, (rx1, ry1), (rx2, ry2), box_color_r, 2)
+                is_lock = (locked_target and target_to_measure.track_id == locked_target.track_id)
+                box_color_r = (0, 0, 255) if is_lock else (0, 255, 0)
+                thick_r = 3 if is_lock else 2
+                cv2.rectangle(disp_r, (rx1, ry1), (rx2, ry2), box_color_r, thick_r)
                 if matched_r_kpts is not None:
                     draw_skeleton(disp_r, matched_r_kpts, color=box_color_r)
 
             if bbox_center_r is not None:
                 cv2.drawMarker(disp_r, (int(bbox_center_r[0]), int(bbox_center_r[1])), (0, 255, 255), cv2.MARKER_CROSS, 18, 2)
                 is_lock = (locked_target and target_to_measure.track_id == locked_target.track_id)
-                tag_r = f"ID #{target_to_measure.track_id}" + (" [LOCKED]" if is_lock else "")
+                tag_r = f"ID #{target_to_measure.track_id}" + (" [LOCKED]" if is_lock else " [MATCHED]")
                 cv2.putText(disp_r, tag_r, (int(bbox_center_r[0]) - 30, max(25, int(bbox_center_r[1]) - 15)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
@@ -987,8 +1045,18 @@ def main():
             comb_h, comb_w = combined_feed.shape[:2]
 
             # ------------------------------------------------------------------
-            # BƯỚC 6: BẢNG ĐIỀU KHIỂN & HUD HIỂN THỊ KHOẢNG CÁCH 3D
+            # BƯỚC 6: GHI KHOẢNG CÁCH RA TERMINAL & HIỂN THỊ TRÊN BẢNG HUD
             # ------------------------------------------------------------------
+            # 6.1. Ghi thông số đo đạc thời gian thực trực tiếp ra Terminal
+            if locked_target and locked_target.is_3d_fresh(now):
+                if now - last_terminal_print_time >= 0.25:
+                    last_terminal_print_time = now
+                    side_str = f" [{locked_target.raise_side}]" if locked_target.raise_side else ""
+                    print(f"[TARGET #{locked_target.track_id} LOCKED{side_str}] Khoang cach -> Trung diem Baseline: "
+                          f"D_mid = {locked_target.d_mid_cm:6.1f} cm | "
+                          f"Z = {locked_target.z_cm:6.1f} cm | "
+                          f"X_mid = {locked_target.x_mid_cm:+6.1f} cm", flush=True)
+
             hud_height = 150
             hud_panel = np.zeros((hud_height, comb_w, 3), dtype=np.uint8)
             hud_panel[:] = (15, 23, 42)
@@ -999,7 +1067,7 @@ def main():
             # Ưu tiên hiển thị thông số 3D của đối tượng đo
             disp_person = locked_target if locked_target else target_to_measure
 
-            if disp_person and disp_person.d_mid_cm is not None:
+            if disp_person and disp_person.d_mid_cm is not None and disp_person.is_3d_fresh(now):
                 x_cm = disp_person.x_mid_cm
                 pos_str = "CHINH GIUA" if abs(x_cm) < 4.0 else (f"LECH PHAI {x_cm:+.1f}cm" if x_cm > 0 else f"LECH TRAI {abs(x_cm):.1f}cm")
                 
