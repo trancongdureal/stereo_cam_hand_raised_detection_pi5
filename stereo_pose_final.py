@@ -298,8 +298,8 @@ class TargetLockController:
                     candidates.append(track)
 
         if candidates:
-            # Chọn người đứng gần camera nhất (bbox cao nhất hoặc Z nhỏ nhất)
-            best_candidate = max(candidates, key=lambda t: t.height if t.z_cm is None else (1.0 / max(1.0, t.z_cm)))
+            # Chọn người đứng gần camera nhất (chiều cao bounding box lớn nhất trong ảnh tương đương đứng gần nhất)
+            best_candidate = max(candidates, key=lambda t: t.height)
             self.locked_track_id = best_candidate.track_id
             self.lock_timestamp = now
             self.status_message = f"DA KHOA TARGET #{self.locked_track_id} (Gio tay > 2s & Gan nhat)"
@@ -360,6 +360,8 @@ class StereoTriangulator:
         pr_rect = cv2.undistortPoints(pr, self.K2, self.D2, R=self.R2, P=self.P2).reshape(-1, 2)
 
         pt_4d = cv2.triangulatePoints(self.P1, self.P2, pl_rect.T, pr_rect.T)
+        if abs(pt_4d[3, 0]) < 1e-6:
+            return 0.0, 0.0, -1.0, -1.0
         pt_3d = pt_4d[:3, :] / pt_4d[3, :]
 
         X_rect = float(pt_3d[0, 0])
@@ -373,9 +375,9 @@ class StereoTriangulator:
         D_mid = float(np.sqrt(X_mid**2 + Y_mid**2 + Z_mid**2))
         return X_mid, Y_mid, Z_mid, D_mid
 
-    def match_epipolar_patch(self, frame_left, frame_right, pt_left, patch_size=35, search_width=350, v_range=30):
+    def match_epipolar_patch(self, frame_left, frame_right, pt_left, patch_size=35, search_width=650, v_range=40):
         """
-        Dò điểm tương ứng trên Cam Phải dọc theo dải epipolar (hỗ trợ độ lệch dọc v_range +-30px).
+        Dò điểm tương ứng trên Cam Phải dọc theo dải epipolar (hỗ trợ độ lệch dọc v_range +-40px, search_width=650px).
         Dùng làm fallback an toàn khi YOLO trên Cam Phải bị che khuất một phần.
         """
         h, w = frame_left.shape[:2]
@@ -391,7 +393,7 @@ class StereoTriangulator:
         y_min = max(0, y_l - v_range)
         y_max = min(h, y_l + v_range + 1)
         x_min = max(0, x_l - search_width)
-        x_max = min(w, x_l + 15)
+        x_max = min(w, x_l + 25)
 
         strip = frame_right[y_min:y_max, x_min:x_max]
         if strip.shape[0] < patch.shape[0] or strip.shape[1] < patch.shape[1]:
@@ -400,7 +402,7 @@ class StereoTriangulator:
         res = cv2.matchTemplate(strip, patch, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
-        if max_val >= 0.35:
+        if max_val >= 0.30:
             matched_x = x_min + max_loc[0] + half_p
             matched_y = y_min + max_loc[1] + half_p
             return (float(matched_x), float(matched_y))
@@ -742,6 +744,7 @@ def main():
     frame_count = 0
     fps_timer = time.time()
     fps = 0.0
+    current_preview_target_id = None
 
     logger.info("Bắt đầu vòng lặp xử lý chính. Nhấn phím 'p' để reset target, phím 'q' để thoát.")
 
@@ -822,9 +825,27 @@ def main():
             if target_to_measure is None and active_tracks:
                 visible_tracks = [t for t in active_tracks.values() if t.lost_frames == 0]
                 if visible_tracks:
-                    # Ưu tiên người đang giơ tay hoặc người có bbox lớn nhất (gần nhất)
+                    # 1. Ưu tiên cao nhất: người đang giơ tay (chọn người giơ tay có bbox lớn nhất)
                     raising = [t for t in visible_tracks if t.is_hand_raised]
-                    target_to_measure = max(raising, key=lambda t: t.height) if raising else max(visible_tracks, key=lambda t: t.height)
+                    if raising:
+                        target_to_measure = max(raising, key=lambda t: t.height)
+                        current_preview_target_id = target_to_measure.track_id
+                    else:
+                        # 2. Nếu không ai giơ tay, giữ nguyên preview target cũ để tránh nhấp nháy qua lại
+                        prev_track = active_tracks.get(current_preview_target_id, None)
+                        if prev_track is not None and prev_track.lost_frames == 0:
+                            # Chỉ đổi người nếu người khác cao hơn hẳn (> 20%)
+                            max_track = max(visible_tracks, key=lambda t: t.height)
+                            if max_track.height > prev_track.height * 1.20:
+                                target_to_measure = max_track
+                                current_preview_target_id = max_track.track_id
+                            else:
+                                target_to_measure = prev_track
+                        else:
+                            target_to_measure = max(visible_tracks, key=lambda t: t.height)
+                            current_preview_target_id = target_to_measure.track_id
+            elif locked_target is not None:
+                current_preview_target_id = locked_target.track_id
 
             bbox_center_r = None
             matched_r_box = None
@@ -848,20 +869,24 @@ def main():
                         r_height = ry2 - ry1
 
                         y_diff = abs(rcy - cy_l)
-                        h_diff = abs(r_height - target_to_measure.height)
-                        # Trong hệ stereo: rcx thường <= cx_l
-                        disp_penalty = max(0.0, rcx - cx_l - 25.0) * 4.0
+                        # Trong hệ stereo: rcx thường <= cx_l (cho phép dung sai lệch lắp ráp +35px)
+                        disp_penalty = max(0.0, rcx - cx_l - 35.0) * 5.0
+
+                        # Chênh lệch chiều cao tương đối
+                        h_ratio = abs(r_height - target_to_measure.height) / max(1.0, target_to_measure.height)
+                        h_penalty = h_ratio * 60.0
 
                         # Trạng thái giơ tay tương thích
                         r_raised, _, _ = check_hand_raise(kpts_r[j])
-                        raise_bonus = 0.0 if (r_raised == target_to_measure.is_hand_raised) else 40.0
+                        raise_penalty = 0.0 if (r_raised == target_to_measure.is_hand_raised) else 25.0
 
-                        cost = y_diff * 2.5 + h_diff * 1.5 + disp_penalty + raise_bonus
+                        cost = y_diff * 2.0 + disp_penalty + h_penalty + raise_penalty
                         if cost < min_cost:
                             min_cost = cost
                             best_match_idx = j
 
-                    if best_match_idx is not None and min_cost < 250.0:
+                    # Ngưỡng chấp nhận nới lỏng (600) hoặc người có cost tốt nhất
+                    if best_match_idx is not None and min_cost < 600.0:
                         rx1, ry1, rx2, ry2 = map(int, boxes_r[best_match_idx])
                         bbox_center_r = (float((rx1 + rx2) / 2.0), float((ry1 + ry2) / 2.0))
                         matched_r_box = (rx1, ry1, rx2, ry2)
@@ -869,15 +894,17 @@ def main():
 
                 # 4.2. Fallback: Nếu YOLO Cam Phải không bắt được, dùng Epipolar Patch Match
                 if bbox_center_r is None:
-                    bbox_center_r = stereo_solver.match_epipolar_patch(frame_l, frame_r, (cx_l, cy_l), v_range=35)
+                    bbox_center_r = stereo_solver.match_epipolar_patch(frame_l, frame_r, (cx_l, cy_l), patch_size=35, search_width=650, v_range=40)
 
-                # 4.3. Giải tam giác đạc 3D
+                # 4.3. Giải tam giác đạc 3D & Kiểm tra tính hợp lệ
                 if bbox_center_r is not None:
                     X_mid, Y_mid, Z_mid, D_mid = stereo_solver.triangulate_single_point((cx_l, cy_l), bbox_center_r)
-                    d_cm = D_mid * 100.0
-                    z_cm = Z_mid * 100.0
-                    x_cm = X_mid * 100.0
-                    target_to_measure.update_3d(d_cm, z_cm, x_cm)
+                    # Chỉ chấp nhận khoảng cách thực tế hợp lệ (Z dương và trong cự ly 0.3m đến 12.0m)
+                    if 0.3 <= Z_mid <= 12.0 and D_mid > 0:
+                        d_cm = D_mid * 100.0
+                        z_cm = Z_mid * 100.0
+                        x_cm = X_mid * 100.0
+                        target_to_measure.update_3d(d_cm, z_cm, x_cm)
 
             # ------------------------------------------------------------------
             # BƯỚC 5: TRỰC QUAN HÓA TRÊN CẢ HAI CAMERA
@@ -987,7 +1014,10 @@ def main():
                 cv2.putText(hud_panel, f"Z (Vuong goc): {disp_person.z_cm:.1f} cm | Vi tri ngang X_mid: [{pos_str}]", 
                             (25, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (74, 222, 128), 2)
             else:
-                cv2.putText(hud_panel, lock_controller.status_message, 
+                status_txt = lock_controller.status_message
+                if disp_person is not None:
+                    status_txt += f" | DANG DO KHOANG CACH #{disp_person.track_id}..."
+                cv2.putText(hud_panel, status_txt, 
                             (25, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (250, 204, 21), 2)
                 cv2.putText(hud_panel, "Gio tay lien tuc >= 2.0s de Khoa Muc Tieu | Bam phim 'p' de Reset", 
                             (25, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (148, 163, 184), 1)
